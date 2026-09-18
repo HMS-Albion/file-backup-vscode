@@ -1,0 +1,59 @@
+{
+  "name": "file-backup",
+  "displayName": "File Backup (.bak)",
+  "description": "Right-click a file or folder in the Explorer to create a .bak copy beside it, byte for byte.",
+  "version": "0.7.0",
+  "publisher": "local-dev",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.138.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "backup",
+    "bak",
+    "copy file",
+    "duplicate"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "fileBackup.backup",
+        "title": "Backup to .bak",
+        "category": "File Backup"
+      },
+      {
+        "command": "fileBackup.stripBak",
+        "title": "Remove .bak Suffix",
+        "category": "File Backup"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "fileBackup.backup",
+          "group": "FileBackup"
+        },
+        {
+          "command": "fileBackup.stripBak",
+          "group": "FileBackup"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.138.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^5.4.5"
+  }
+}

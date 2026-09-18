@@ -1,0 +1,13 @@
+# 构建产物与依赖
+node_modules/
+out/
+dist/
+*.vsix
+*.log
+
+# VS Code 调试/测试残留
+.vscode-test/
+
+# 编辑器与系统杂项
+.DS_Store
+Thumbs.db

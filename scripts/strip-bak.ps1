@@ -1,6 +1,7 @@
 #Requires -Version 5.1
-# Restores files from their .bak copies: copy -> hash-verify -> delete.
-# The folder (or single file) to process arrives in $env:FB_ROOT, so no path
+# Strips configured suffixes (e.g. .bak, .c, .c1) off file names: copy ->
+# hash-verify -> delete. The path to process arrives in $env:FB_ROOT and the
+# suffix list in $env:FB_SUFFIXES (comma separated, outermost first), so neither
 # ever has to survive command-line quoting.
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +14,15 @@ if (-not (Test-Path -LiteralPath $root)) {
     throw "Path not found: $root"
 }
 
+$suffixList = $env:FB_SUFFIXES
+if ([string]::IsNullOrWhiteSpace($suffixList)) {
+    $suffixList = '.bak'
+}
+$suffixes = @($suffixList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+$escaped = @($suffixes | ForEach-Object { [regex]::Escape($_) })
+$numberedPattern = '(' + ($escaped -join '|') + ')\.\d+$'
+
 $result = [pscustomobject]@{
     restored  = @()
     conflicts = @()
@@ -21,6 +31,8 @@ $result = [pscustomobject]@{
     failed    = @()
 }
 
+$isLeaf = Test-Path -LiteralPath $root -PathType Leaf
+
 function Get-CandidateFiles([string]$path) {
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         return @(Get-Item -LiteralPath $path)
@@ -28,19 +40,45 @@ function Get-CandidateFiles([string]$path) {
     return @(Get-ChildItem -LiteralPath $path -File -Recurse -Force)
 }
 
-# The whole tree is enumerated up front, so restoring a file cannot disturb iteration.
+# Removes each configured suffix at most once, in list order:
+# "notes.txt.c.bak" -> "notes.txt", but "legacy.c" keeps its real extension
+# because the .c suffix slot was already spent on the appended one.
+function Get-StrippedName([string]$name) {
+    $working = $name
+
+    foreach ($s in $suffixes) {
+        if ($working.EndsWith($s)) {
+            $working = $working.Substring(0, $working.Length - $s.Length)
+        }
+    }
+
+    if (-not $working) {
+        return $name
+    }
+
+    return $working
+}
+
 foreach ($file in Get-CandidateFiles $root) {
     $name = $file.Name
+    $isNumbered = $name -match $numberedPattern
 
-    if ($name -match '\.bak\.\d+$') {
+    # A numbered name is only left alone while scanning a folder. When the caller
+    # pointed straight at that file, it is an explicit choice and gets restored.
+    if ($isNumbered -and -not $isLeaf) {
         $result.numbered += $name
         continue
     }
-    if ($name -notmatch '\.bak$') {
+    if ($isNumbered) {
+        $name = $name -replace '\.\d+$', ''
+    }
+
+    $targetName = Get-StrippedName $name
+    if (-not $targetName -or $targetName -eq $name) {
         continue
     }
 
-    $targetPath = $file.FullName.Substring(0, $file.FullName.Length - 4)
+    $targetPath = Join-Path -Path $file.DirectoryName -ChildPath $targetName
 
     if (Test-Path -LiteralPath $targetPath) {
         $result.conflicts += $name

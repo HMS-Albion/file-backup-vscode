@@ -86,7 +86,8 @@ async function roundTrip(script: string, source: string): Promise<ActionResult> 
     ? await copyWithSuffix(source, cfg.backupSuffix)
     : await copyWithSuffix(renamed[0].after, cfg.backupSuffix);
 
-  const keptSources = await deleteVerifiedSources(plan.pairs);
+  // 文件夹转换不再删除源文件，改名后的形态留在原地；右键单个文件仍按删源处理。
+  const keptSources = isDir ? [] : await deleteVerifiedSources(plan.pairs);
 
   const scope = plan.snapshot ?? plan.pairs[0]?.target;
   if (!scope) {
@@ -94,12 +95,23 @@ async function roundTrip(script: string, source: string): Promise<ActionResult> 
   }
   const stripped = await stripBakSuffix(script, scope, [cfg.backupSuffix, cfg.normalSuffix, cfg.protectedSuffix]);
 
+  // 文件夹流程不删源，所以改名后的文件还留在原地：只对本流程改过名的那些文件
+  // 复原原名（白名单精确匹配），避免误伤 `*.bak` 目录里没被改名的文件。
+  // 必须按改名的逆序撤销——正序会让先复原的文件占掉后一个的目标名。
+  const suffixList = [cfg.backupSuffix, cfg.normalSuffix, cfg.protectedSuffix];
+  const restoredSources = isDir
+    ? await stripBakSuffix(script, source, suffixList, renamed.map((r) => r.after).reverse())
+    : { restored: [], conflicts: [], numbered: [], undeleted: [], failed: [] };
+
   const extras = [
     keptSources.length ? `${keptSources.length} 个源文件校验不符而未删` : "",
     stripped.conflicts.length ? `${stripped.conflicts.length} 个同名冲突跳过` : "",
     stripped.numbered.length ? `${stripped.numbered.length} 个编号副本未处理` : "",
     stripped.undeleted.length ? `${stripped.undeleted.length} 个副本未能删除` : "",
     stripped.failed.length ? `${stripped.failed.length} 个校验失败已回滚` : "",
+    restoredSources.conflicts.length ? `源里 ${restoredSources.conflicts.length} 个同名冲突未复原` : "",
+    restoredSources.failed.length ? `源里 ${restoredSources.failed.length} 个校验失败` : "",
+    restoredSources.undeleted.length ? `源里 ${restoredSources.undeleted.length} 个改名件未能删除` : "",
   ].filter(Boolean);
 
   return {
@@ -107,8 +119,10 @@ async function roundTrip(script: string, source: string): Promise<ActionResult> 
     note:
       `${basename(source)}${isDir ? "/" : ""} → 改名 ${renamed.length} 个，` +
       `等 ${DELETE_DELAY_MS / 1000}s，生成 ${cfg.backupSuffix} ${plan.pairs.length} 份，` +
-      `删源 ${plan.pairs.length - keptSources.length} 个，` +
-      `复原 ${stripped.restored.length} 个${extras.length ? `（${extras.join("，")}）` : ""}`,
+      (isDir
+        ? `源复原 ${restoredSources.restored.length} 个，`
+        : `删源 ${plan.pairs.length - keptSources.length} 个，`) +
+      `备份复原 ${stripped.restored.length} 个${extras.length ? `（${extras.join("，")}）` : ""}`,
   };
 }
 

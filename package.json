@@ -2,7 +2,7 @@
   "name": "file-backup",
   "displayName": "File Backup (.bak)",
   "description": "Right-click a file or folder in the Explorer to create a .bak copy beside it, byte for byte.",
-  "version": "0.10.0",
+  "version": "0.12.0",
   "publisher": "local-dev",
   "license": "MIT",
   "engines": {

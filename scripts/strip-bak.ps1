@@ -40,6 +40,25 @@ function Get-CandidateFiles([string]$path) {
     return @(Get-ChildItem -LiteralPath $path -File -Recurse -Force)
 }
 
+# FB_ONLY lists exact absolute paths the caller just renamed, newline separated.
+# When present nothing is scanned, so files the flow never touched (for example
+# inside a `*.bak` directory) cannot be renamed by accident.
+$onlyRaw = $env:FB_ONLY
+if ([string]::IsNullOrWhiteSpace($onlyRaw)) {
+    $candidates = @(Get-CandidateFiles $root)
+    $explicit = $isLeaf
+}
+else {
+    $candidates = @()
+    foreach ($line in $onlyRaw -split "`n") {
+        $target = $line.Trim()
+        if ($target -and (Test-Path -LiteralPath $target -PathType Leaf)) {
+            $candidates += Get-Item -LiteralPath $target
+        }
+    }
+    $explicit = $true
+}
+
 # Removes each configured suffix at most once, in list order:
 # "notes.txt.c.bak" -> "notes.txt", but "legacy.c" keeps its real extension
 # because the .c suffix slot was already spent on the appended one.
@@ -59,13 +78,13 @@ function Get-StrippedName([string]$name) {
     return $working
 }
 
-foreach ($file in Get-CandidateFiles $root) {
+foreach ($file in $candidates) {
     $name = $file.Name
     $isNumbered = $name -match $numberedPattern
 
     # A numbered name is only left alone while scanning a folder. When the caller
-    # pointed straight at that file, it is an explicit choice and gets restored.
-    if ($isNumbered -and -not $isLeaf) {
+    # named that file explicitly, it is a deliberate choice and gets restored.
+    if ($isNumbered -and -not $explicit) {
         $result.numbered += $name
         continue
     }

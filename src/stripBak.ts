@@ -20,22 +20,34 @@ export interface StripResult {
  * deleting the copy it consumed. Suffixes are stripped repeatedly, so
  * `notes.txt.c.bak` ends up as `notes.txt`.
  *
- * The path and suffix list travel in FB_ROOT / FB_SUFFIXES rather than on the
- * command line, so names with spaces or shell metacharacters cannot break it.
+ * Pass `only` to restrict the run to an exact list of files instead of scanning
+ * `targetPath` — used when the caller already knows which names it changed and
+ * must not touch anything else in the tree.
+ *
+ * Paths and suffixes travel in FB_ROOT / FB_SUFFIXES / FB_ONLY rather than on
+ * the command line, so names with spaces or shell metacharacters cannot break
+ * the invocation.
  */
 export function stripBakSuffix(
   scriptPath: string,
   targetPath: string,
-  suffixes: string[] = [".bak"]
+  suffixes: string[] = [".bak"],
+  only?: string[]
 ): Promise<StripResult> {
   return new Promise<StripResult>((resolve, reject) => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      FB_ROOT: targetPath,
+      FB_SUFFIXES: suffixes.join(","),
+    };
+    if (only) {
+      env.FB_ONLY = only.join("\n");
+    }
+
     const child = spawn(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-      {
-        env: { ...process.env, FB_ROOT: targetPath, FB_SUFFIXES: suffixes.join(",") },
-        windowsHide: true,
-      }
+      { env, windowsHide: true }
     );
 
     let stdout = "";

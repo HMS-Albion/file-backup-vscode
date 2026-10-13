@@ -12,6 +12,8 @@ export interface StripResult {
   undeleted: string[];
   /** Copy or hash verification failed; the target was rolled back. */
   failed: string[];
+  /** Directories PowerShell could not enumerate, or allow-list paths that vanished. */
+  unreadableDirs: string[];
 }
 
 /**

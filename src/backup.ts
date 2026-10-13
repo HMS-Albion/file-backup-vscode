@@ -14,6 +14,12 @@ export interface CopyPair {
 export interface CopyPlan {
   snapshot?: string;
   pairs: CopyPair[];
+  /** Files that could not be copied; the walk continues past them. */
+  failed: { file: string; reason: string }[];
+  /** Backup-named directories left alone, relative to the source root. */
+  skippedDirs: string[];
+  /** Directories that could not be listed. */
+  unreadableDirs: string[];
 }
 
 /**
@@ -31,12 +37,6 @@ export async function createBackup(srcPath: string, destDir?: string, suffix = B
   return target;
 }
 
-/** Whole-tree backup of a directory: `<dir>.bak/` holding only `<file>.bak` copies. */
-export async function backupDirectory(dirPath: string, suffix = BAK): Promise<string[]> {
-  const plan = await copyWithSuffix(dirPath, suffix);
-  return [plan.snapshot as string, ...plan.pairs.map((p) => p.target)];
-}
-
 /**
  * Produces `<name><suffix>` copies of everything under srcPath.
  *
@@ -45,59 +45,125 @@ export async function backupDirectory(dirPath: string, suffix = BAK): Promise<st
  * are never copied into the snapshot, and the source tree is never modified.
  * Entries that already look like `.bak` backups are skipped.
  */
-export async function copyWithSuffix(srcPath: string, suffix = BAK): Promise<CopyPlan> {
+export async function copyWithSuffix(srcPath: string, suffix = BAK, onProgress?: FileProgress): Promise<CopyPlan> {
   const info = await stat(srcPath);
 
   if (info.isFile()) {
-    return { pairs: [{ source: srcPath, target: await createBackup(srcPath, undefined, suffix) }] };
+    const plan = emptyPlan();
+    await attemptCopy(srcPath, undefined, suffix, srcPath, plan, onProgress);
+    return plan;
   }
 
   const snapshot = await nextFreePath(path.join(path.dirname(srcPath), path.basename(srcPath) + suffix));
-  const plan: CopyPlan = { snapshot, pairs: [] };
-  await mirrorInto(srcPath, snapshot, plan, suffix);
+  const plan = emptyPlan();
+  plan.snapshot = snapshot;
+  await mirrorInto(srcPath, snapshot, plan, suffix, srcPath, onProgress);
   return plan;
+}
+
+function emptyPlan(): CopyPlan {
+  return { pairs: [], failed: [], skippedDirs: [], unreadableDirs: [] };
+}
+
+async function attemptCopy(
+  srcFile: string,
+  destDir: string | undefined,
+  suffix: string,
+  root: string,
+  plan: CopyPlan,
+  onProgress?: FileProgress
+): Promise<void> {
+  const name = relativeOf(root, srcFile);
+
+  try {
+    const target = await createBackup(srcFile, destDir, suffix);
+    plan.pairs.push({ source: srcFile, target });
+  } catch (err) {
+    plan.failed.push({ file: name, reason: errorMessage(err) });
+  }
+
+  onProgress?.(plan.pairs.length + plan.failed.length, name);
 }
 
 /**
  * Deletes each pair's source file, but only after confirming the copy is
  * byte-identical. Returns the sources that were kept, so a caller can report
- * exactly what was not removed.
+ * exactly what was not removed. A comparison that throws also keeps the file.
  */
-export async function deleteVerifiedSources(pairs: CopyPair[]): Promise<string[]> {
+export async function deleteVerifiedSources(
+  pairs: CopyPair[],
+  onProgress?: FileProgress
+): Promise<string[]> {
   const kept: string[] = [];
 
   for (const { source, target } of pairs) {
-    if (!(await identical(source, target))) {
-      kept.push(source);
-      continue;
-    }
-
     try {
+      if (!(await identical(source, target))) {
+        kept.push(source);
+        continue;
+      }
+
       await unlink(source);
     } catch {
       kept.push(source);
     }
+
+    onProgress?.(kept.length, relativeOf(path.dirname(target), source));
   }
 
   return kept;
 }
 
-async function mirrorInto(srcDir: string, destDir: string, plan: CopyPlan, suffix: string): Promise<void> {
-  await mkdir(destDir, { recursive: true });
+/** Progress callback: (done, name) for the file just finished. */
+export type FileProgress = (done: number, name: string) => void;
 
-  for (const entry of await readdir(srcDir, { withFileTypes: true })) {
+async function mirrorInto(
+  srcDir: string,
+  destDir: string,
+  plan: CopyPlan,
+  suffix: string,
+  root: string,
+  onProgress?: FileProgress
+): Promise<void> {
+  try {
+    await mkdir(destDir, { recursive: true });
+  } catch (err) {
+    plan.unreadableDirs.push(`${relativeOf(root, destDir)} (无法创建: ${errorMessage(err)})`);
+    return;
+  }
+
+  let entries;
+  try {
+    entries = await readdir(srcDir, { withFileTypes: true });
+  } catch (err) {
+    plan.unreadableDirs.push(`${relativeOf(root, srcDir)} (${errorMessage(err)})`);
+    return;
+  }
+
+  for (const entry of entries) {
+    const srcFile = path.join(srcDir, entry.name);
+
     if (isBackupName(entry.name, suffix)) {
+      if (entry.isDirectory()) {
+        plan.skippedDirs.push(relativeOf(root, srcFile));
+      }
       continue;
     }
 
-    const srcFile = path.join(srcDir, entry.name);
     if (entry.isDirectory()) {
-      await mirrorInto(srcFile, path.join(destDir, entry.name), plan, suffix);
+      await mirrorInto(srcFile, path.join(destDir, entry.name), plan, suffix, root, onProgress);
     } else if (entry.isFile()) {
-      const target = await createBackup(srcFile, destDir, suffix);
-      plan.pairs.push({ source: srcFile, target });
+      await attemptCopy(srcFile, destDir, suffix, root, plan, onProgress);
     }
   }
+}
+
+function relativeOf(root: string, target: string): string {
+  return path.relative(root, target).split(path.sep).join("/") || path.basename(target);
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message.slice(0, 120) : String(err);
 }
 
 /**

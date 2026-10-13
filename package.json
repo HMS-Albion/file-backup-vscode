@@ -2,7 +2,7 @@
   "name": "file-backup",
   "displayName": "File Backup (.bak)",
   "description": "Right-click a file or folder in the Explorer to create a .bak copy beside it, byte for byte.",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "publisher": "local-dev",
   "license": "MIT",
   "engines": {
@@ -82,7 +82,9 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package"
+    "package": "vsce package",
+    "verify": "node test/verify.cjs",
+    "verify:scale": "node test/scale-check.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",

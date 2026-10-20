@@ -1,7 +1,8 @@
-import { readdir, rename, stat } from "fs/promises";
+import { readdir, stat } from "fs/promises";
 import * as path from "path";
 import type { Settings } from "./config";
 import { isBackupName, nextFreePath, type FileProgress } from "./backup";
+import { runShellScript } from "./shell";
 
 export interface RenamePair {
   before: string;
@@ -10,12 +11,34 @@ export interface RenamePair {
 
 export interface RenameOutcome {
   pairs: RenamePair[];
-  /** Files rename() refused (locked, permissions, path too long). */
+  /** Files the shell refused to rename (locked, permissions, path too long). */
   failed: { file: string; reason: string }[];
   /** Backup-named directories left alone, relative to the root. */
   skippedDirs: string[];
   /** Directories that could not be listed at all. */
   unreadableDirs: string[];
+}
+
+/** What scripts/rename-files.ps1 answers with. */
+interface RenameScriptResult {
+  renamed: { from: string; to: string }[];
+  failed: { file: string; reason: string }[];
+}
+
+/**
+ * The shell script reports stable codes instead of Chinese text, because
+ * PowerShell 5.1 would decode non-ASCII literals in the script as mojibake.
+ * The readable wording is added here, where it survives the pipe.
+ */
+const REASON_TEXT: Record<string, string> = {
+  "source-missing": "源文件不存在",
+  "target-taken": "目标名称已被占用",
+  "malformed-instruction": "重命名指令格式错误",
+  "move-failed": "重命名失败",
+};
+
+function reasonText(code: string): string {
+  return REASON_TEXT[code] ?? code;
 }
 
 /**
@@ -37,18 +60,19 @@ export function suffixFor(name: string, cfg: Settings, includeBackups: boolean):
 }
 
 /**
- * Renames files for the transform round trip.
+ * Works out the new name of every file under root that takes part in the
+ * transform round trip.
+ *
+ * Nothing is moved here — the plan is only computed. The actual rename is done
+ * by the shell script, so one locked file cannot abort the rest of the tree.
  *
  * A single file is only renamed when it is not itself a backup; a directory
  * renames everything inside it, backups included, so nothing is left behind.
  * Directories named like backups (previous snapshots) are skipped, but the skip
  * is reported instead of being silent — and the check follows the configured
  * backupSuffix rather than a hardcoded `.bak`.
- *
- * A file that cannot be renamed is collected into `failed` and the rest of the
- * tree keeps going; one locked file must not cost 400 processed files.
  */
-export async function renameForTransform(
+export async function planRenames(
   root: string,
   cfg: Settings,
   onProgress?: FileProgress
@@ -59,7 +83,8 @@ export async function renameForTransform(
   if (info.isFile()) {
     const suffix = suffixFor(path.basename(root), cfg, false);
     if (suffix) {
-      await attemptRename(root, suffix, root, result, onProgress);
+      const after = await nextFreePath(root + suffix);
+      result.pairs.push({ before: root, after });
     }
     return result;
   }
@@ -97,31 +122,61 @@ export async function renameForTransform(
     ...pending.filter((p) => p.suffix !== cfg.protectedSuffix),
   ];
 
+  // The target name is only reserved now, the rename itself happens in one
+  // shell call below. Numbering therefore reflects the order the shell will
+  // apply, and two files that want the same name still get distinct targets.
   for (const item of ordered) {
-    await attemptRename(item.file, item.suffix, root, result, onProgress);
+    const after = await nextFreePath(item.file + item.suffix);
+    result.pairs.push({ before: item.file, after });
   }
 
   return result;
 }
 
-async function attemptRename(
-  file: string,
-  suffix: string,
+/**
+ * Renames the planned files by handing the whole list to the shell script.
+ *
+ * The script moves each file and reports what it could not move. The plan is
+ * the source of truth for the new names; the script only confirms which of them
+ * actually happened, so a failure is attributed to the right file.
+ */
+export async function applyRenames(
+  scriptPath: string,
   root: string,
-  result: RenameOutcome,
-  onProgress: FileProgress | undefined
-): Promise<void> {
-  const name = relativeOf(root, file);
-
-  try {
-    const after = await nextFreePath(file + suffix);
-    await rename(file, after);
-    result.pairs.push({ before: file, after });
-  } catch (err) {
-    result.failed.push({ file: name, reason: reason(err) });
+  pairs: RenamePair[],
+  onProgress?: FileProgress
+): Promise<RenameOutcome> {
+  const result: RenameOutcome = { pairs: [], failed: [], skippedDirs: [], unreadableDirs: [] };
+  if (pairs.length === 0) {
+    return result;
   }
 
-  onProgress?.(result.pairs.length + result.failed.length, name);
+  const env = { FB_RENAMES: pairs.map((p) => `${p.before}\t${p.after}`).join("\n") };
+  const output = await runShellScript<RenameScriptResult>(scriptPath, env);
+
+  const moved = new Set((output.renamed ?? []).map((r) => r.from));
+  for (const pair of pairs) {
+    if (moved.has(pair.before)) {
+      result.pairs.push(pair);
+    }
+  }
+
+  // The script names the files it refused; anything it did not report at all
+  // and did not move is a failure too, so nothing is silently dropped.
+  for (const pair of pairs) {
+    if (moved.has(pair.before)) {
+      continue;
+    }
+    const reportedFailure = (output.failed ?? []).find((f) => f.file === pair.before);
+    result.failed.push({
+      file: relativeOf(root, pair.before),
+      reason: reportedFailure ? reasonText(reportedFailure.reason) : "重命名未完成",
+    });
+  }
+
+  onProgress?.(result.pairs.length + result.failed.length, "");
+
+  return result;
 }
 
 function reason(err: unknown): string {

@@ -1,10 +1,11 @@
 import { stat } from "fs/promises";
-import { basename } from "path";
+import { basename, dirname, join } from "path";
 import { commands, ExtensionContext, ProgressLocation, Uri, window } from "vscode";
-import { copyWithSuffix, deleteVerifiedSources, type CopyPlan, type FileProgress } from "./backup";
+import { copyWithSuffix, deleteVerifiedSources, type CopyPair, type CopyPlan, type FileProgress } from "./backup";
 import { getSettings } from "./config";
-import { scriptPathFor, stripBakSuffix, type StripResult } from "./stripBak";
-import { renameForTransform } from "./transform";
+import { stripBakSuffix, type StripMapping, type StripResult } from "./stripBak";
+import { scriptPathFor } from "./shell";
+import { planRenames, applyRenames, type RenamePair } from "./transform";
 
 const BACKUP_COMMAND = "fileBackup.backup";
 const STRIP_COMMAND = "fileBackup.stripBak";
@@ -22,7 +23,8 @@ const EMPTY_STRIP: StripResult = {
 };
 
 export function activate(context: ExtensionContext): void {
-  const script = scriptPathFor(context.extensionPath);
+  const script = scriptPathFor(context.extensionPath, "strip-bak.ps1");
+  const renameScript = scriptPathFor(context.extensionPath, "rename-files.ps1");
 
   context.subscriptions.push(
     commands.registerCommand(BACKUP_COMMAND, (t, s) => runOver("生成", "个备份", t, s, backupOne)),
@@ -30,7 +32,7 @@ export function activate(context: ExtensionContext): void {
       runOver("还原", "个文件", t, s, (src, onFile) => stripOne(script, src, onFile))
     ),
     commands.registerCommand(ROUND_TRIP_COMMAND, (t, s) =>
-      runOver("往返完成", "个文件", t, s, (src, onFile) => roundTrip(script, src, onFile))
+      runOver("往返完成", "个文件", t, s, (src, onFile) => roundTrip(script, renameScript, src, onFile))
     )
   );
 }
@@ -62,36 +64,59 @@ async function stripOne(script: string, source: string, onFile: FileProgress): P
 
 /**
  * Six phases, in order and none of them optional:
- * 1. rename in place — protected extensions gain `.c1`, everything else `.c`;
+ * 1. rename in place — protected extensions gain `.c1`, everything else `.c`
+ *    (the target names are planned in TS, the move itself is done by the shell
+ *    script scripts/rename-files.ps1);
  * 2. wait 2 seconds;
  * 3. copy everything into `.bak` backups (a folder becomes `<dir>.bak/`);
  * 4. delete the renamed sources (single-file case only), after byte comparison;
  * 5. PowerShell strips the suffixes inside the backups;
  * 6. PowerShell strips them in the source folder too, in reverse rename order.
  *
+ * Phases 5 and 6 do not guess the original name from the suffixes. The flow
+ * already knows every rename it performed, so it hands PowerShell an exact
+ * ledger of "this file, under this name, goes back to that name". That is what
+ * keeps a user file whose own extension happens to look like one of our
+ * suffixes (`report.c1`, `notes.txt.c`) intact instead of losing the tail.
+ *
  * Every phase isolates per-file failures: one locked file can no longer cost the
  * rest of the tree, and skipped/unreadable directories are named in the report.
  */
-async function roundTrip(script: string, source: string, onFile: FileProgress): Promise<ActionResult> {
+async function roundTrip(
+  script: string,
+  renameScript: string,
+  source: string,
+  onFile: FileProgress
+): Promise<ActionResult> {
   const cfg = getSettings();
   const isDir = (await stat(source)).isDirectory();
   const suffixList = [cfg.backupSuffix, cfg.normalSuffix, cfg.protectedSuffix];
 
-  const renamed = await renameForTransform(source, cfg, onFile);
+  const planned = await planRenames(source, cfg, onFile);
+  const renamed = await applyRenames(renameScript, source, planned.pairs, onFile);
+  renamed.skippedDirs = planned.skippedDirs;
+  renamed.unreadableDirs = planned.unreadableDirs;
   if (renamed.pairs.length === 0) {
-    if (!isDir) {
-      return { count: 0, note: `${basename(source)} 本身就是备份文件，未做改动` };
-    }
-    throw new Error("没有可改名的文件");
+    return nothingToRename(isDir, source, renamed.failed);
   }
 
   await sleep(DELETE_DELAY_MS);
 
   const plan = await copyWithSuffix(isDir ? source : renamed.pairs[0].after, cfg.backupSuffix, onFile);
   const keptSources = isDir ? [] : await deleteVerifiedSources(plan.pairs, onFile);
-  const stripped = await stripBakSuffix(script, scopeOf(plan), suffixList);
+
+  // Phase 5: the backups go back to the name their file had before phase 1.
+  const backupLedger = ledgerForBackups(renamed.pairs, plan.pairs);
+  const stripped = await stripBakSuffix(script, scopeOf(plan), suffixList, undefined, backupLedger);
+
+  // Phase 6: the renamed sources in the source folder go back to their own names.
+  // The order matters: `foo` became `foo.c`, and `foo.c` became `foo.c.c1`, so
+  // `foo.c` is only free again once `foo.c.c1` is restored first.
+  const sourceLedger = isDir
+    ? orderLedger([...renamed.pairs].reverse().map((r) => ({ from: r.after, to: r.before })))
+    : [];
   const restoredSources = isDir
-    ? await stripBakSuffix(script, source, suffixList, renamed.pairs.map((r) => r.after).reverse())
+    ? await stripBakSuffix(script, source, suffixList, undefined, sourceLedger)
     : EMPTY_STRIP;
 
   const problems = [
@@ -100,7 +125,7 @@ async function roundTrip(script: string, source: string, onFile: FileProgress): 
       ...describePlan(plan),
       keptSources.length ? `${keptSources.length} 个源文件校验不符而未删` : "",
       ...describeStrip(stripped, "备份"),
-      isDir ? describeStrip(restoredSources, "源里") : [],
+      ...(isDir ? describeStrip(restoredSources, "源里") : []),
     ].filter(Boolean)),
   ];
 
@@ -114,6 +139,91 @@ async function roundTrip(script: string, source: string, onFile: FileProgress): 
         : `删源 ${plan.pairs.length - keptSources.length} 个，`) +
       `备份复原 ${stripped.restored.length} 个${problems.length ? `（${problems.join("；")}）` : ""}`,
   };
+}
+
+/**
+ * Builds the "put this backup back under that name" ledger.
+ *
+ * A backup lives at `<snapshot>/<relative dir>/<renamed name>.bak`, and the name
+ * it has to regain is the one the file carried before phase 1 — so the ledger is
+ * keyed off the phase-1 rename that produced the copied file. Backups whose copy
+ * failed simply do not appear, because there is nothing to restore.
+ */
+function ledgerForBackups(renames: RenamePair[], copies: CopyPair[]): StripMapping[] {
+  const renamedByPath = new Map(renames.map((r) => [r.after, r]));
+
+  const ledger: StripMapping[] = [];
+  for (const copy of copies) {
+    const rename = renamedByPath.get(copy.source);
+    if (!rename) {
+      continue;
+    }
+    ledger.push({
+      from: copy.target,
+      to: join(dirname(copy.target), basename(rename.before)),
+    });
+  }
+
+  return orderLedger(ledger);
+}
+
+/**
+ * Orders restores so that no restore ever overwrites a file another restore
+ * still has to read.
+ *
+ * A restore writes its target name and then deletes its source. If the target of
+ * one restore is the source of another, the second one would read a file that
+ * the first one already replaced — silently putting the wrong bytes back. So a
+ * restore waits until no pending restore still reads from the name it wants to
+ * write.
+ *
+ * The order it starts from is the rename order, which keeps the common case
+ * (`foo` and `foo.c` in one folder) on the path that was already proven to work.
+ */
+function orderLedger(entries: StripMapping[]): StripMapping[] {
+  const pending = [...entries];
+  const ordered: StripMapping[] = [];
+  const pendingSources = new Set(pending.map((e) => e.from));
+
+  while (pending.length > 0) {
+    const index = pending.findIndex((e) => !pendingSources.has(e.to));
+    if (index < 0) {
+      // Unreachable for distinct source names, but a stuck entry must not loop.
+      ordered.push(...pending);
+      break;
+    }
+
+    const [entry] = pending.splice(index, 1);
+    pendingSources.delete(entry.from);
+    ordered.push(entry);
+  }
+
+  return ordered;
+}
+/**
+ * Nothing could be renamed. A single file that is already a backup is left
+ * alone on purpose; anything else is a real failure and says so, instead of
+ * blaming the file's name for a rename that never happened.
+ */
+function nothingToRename(
+  isDir: boolean,
+  source: string,
+  failed: { file: string; reason: string }[]
+): ActionResult {
+  if (failed.length > 0) {
+    const detail = list(failed.map((f) => `${f.file} (${f.reason})`));
+    throw new Error(
+      isDir
+        ? `没有可改名的文件，${failed.length} 个改名失败：${detail}`
+        : `改名失败：${detail}`
+    );
+  }
+
+  if (!isDir) {
+    return { count: 0, note: `${basename(source)} 本身就是备份文件，未做改动` };
+  }
+
+  throw new Error("没有可改名的文件");
 }
 
 function scopeOf(plan: CopyPlan): string {

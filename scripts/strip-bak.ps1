@@ -80,22 +80,59 @@ function Get-TreeFiles([string]$start) {
     return $found
 }
 
-# FB_ONLY lists exact absolute paths the caller just renamed, newline separated.
-# When present nothing is scanned, so files the flow never touched (for example
-# inside a `*.bak` directory) cannot be renamed by accident.
+# Candidate collection has three modes, picked by the environment:
+#   FB_MAP  — exact "<from><TAB><to>" ledger written by the round trip; nothing is guessed.
+#   FB_ONLY — exact list of paths, but the target name is still derived from the suffixes.
+#   neither — scan the tree under FB_ROOT.
+# Whichever mode runs, every candidate is normalised to {Item, TargetPath}, where a null
+# TargetPath means "work the target name out from the suffixes yourself".
+
 $onlyRaw = $env:FB_ONLY
-if ([string]::IsNullOrWhiteSpace($onlyRaw)) {
-    $candidates = @(if ($isLeaf) { @(Get-Item -LiteralPath $root) } else { Get-TreeFiles $root })
+$mapRaw = $env:FB_MAP
+$mapMode = -not [string]::IsNullOrWhiteSpace($mapRaw)
+$candidates = New-Object System.Collections.Generic.List[object]
+
+if ($mapMode) {
+    foreach ($line in $mapRaw -split "`n") {
+        if (-not $line.Trim()) { continue }
+        $parts = $line -split "`t"
+        if ($parts.Count -lt 2) {
+            $result.failed += "FB_MAP 行缺少制表符: $line"
+            continue
+        }
+        # Only the first tab separates the two paths; a tab inside a file name
+        # stays part of the name.
+        $from = $parts[0].Trim()
+        $to = ($parts[1..($parts.Count - 1)] -join "`t").Trim()
+        try {
+            $probe = Add-LongPathPrefix $from
+            if (Test-Path -LiteralPath $probe -PathType Leaf) {
+                $candidates.Add([pscustomobject]@{ Item = (Get-Item -LiteralPath $probe); Path = $probe; TargetPath = (Add-LongPathPrefix $to) })
+            }
+            else {
+                $result.unreadableDirs += "映射里的路径已不存在: $from"
+            }
+        }
+        catch {
+            $result.unreadableDirs += $_.Exception.Message
+        }
+    }
+    $explicit = $true
+}
+elseif ([string]::IsNullOrWhiteSpace($onlyRaw)) {
+    foreach ($f in @(if ($isLeaf) { @(Get-Item -LiteralPath $root) } else { Get-TreeFiles $root })) {
+        $candidates.Add([pscustomobject]@{ Item = $f; Path = $f.FullName; TargetPath = $null })
+    }
     $explicit = $isLeaf
 }
 else {
-    $candidates = New-Object System.Collections.Generic.List[object]
     foreach ($line in $onlyRaw -split "`n") {
         $target = $line.Trim()
         if (-not $target) { continue }
         try {
-            if (Test-Path -LiteralPath (Add-LongPathPrefix $target) -PathType Leaf) {
-                $candidates.Add((Get-Item -LiteralPath (Add-LongPathPrefix $target)))
+            $probe = Add-LongPathPrefix $target
+            if (Test-Path -LiteralPath $probe -PathType Leaf) {
+                $candidates.Add([pscustomobject]@{ Item = (Get-Item -LiteralPath $probe); Path = $probe; TargetPath = $null })
             }
             else {
                 $result.unreadableDirs += "白名单里的路径已不存在: $target"
@@ -128,7 +165,8 @@ function Get-StrippedName([string]$name) {
     return $working
 }
 
-foreach ($file in $candidates) {
+foreach ($candidate in $candidates) {
+    $file = $candidate.Item
     $name = $file.Name
     $isNumbered = $name -match $numberedPattern
 
@@ -138,16 +176,20 @@ foreach ($file in $candidates) {
         $result.numbered += $name
         continue
     }
-    if ($isNumbered) {
+    if ($isNumbered -and -not $mapMode) {
         $name = $name -replace '\.\d+$', ''
     }
 
-    $targetName = Get-StrippedName $name
-    if (-not $targetName -or $targetName -eq $name) {
-        continue
+    # FB_MAP carries the exact destination, so a file that legitimately ends in one
+    # of our suffixes (`report.c1`) keeps its name instead of being over-stripped.
+    $targetPath = $candidate.TargetPath
+    if (-not $targetPath) {
+        $targetName = Get-StrippedName $name
+        if (-not $targetName -or $targetName -eq $name) {
+            continue
+        }
+        $targetPath = Join-Path -Path $file.DirectoryName -ChildPath $targetName
     }
-
-    $targetPath = Join-Path -Path $file.DirectoryName -ChildPath $targetName
 
     if (Test-Path -LiteralPath $targetPath) {
         $result.conflicts += $name
@@ -155,9 +197,9 @@ foreach ($file in $candidates) {
     }
 
     try {
-        Copy-Item -LiteralPath $file.FullName -Destination $targetPath -Force
+        Copy-Item -LiteralPath $candidate.Path -Destination $targetPath -Force
 
-        $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        $sourceHash = (Get-FileHash -LiteralPath $candidate.Path -Algorithm SHA256).Hash
         $targetHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash
 
         if ($sourceHash -ne $targetHash) {
@@ -171,7 +213,7 @@ foreach ($file in $candidates) {
         $result.restored += $restored.Name
 
         try {
-            Remove-Item -LiteralPath $file.FullName -Force
+            Remove-Item -LiteralPath $candidate.Path -Force
         }
         catch {
             $result.undeleted += $name

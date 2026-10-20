@@ -1,5 +1,4 @@
-import { spawn } from "child_process";
-import * as path from "path";
+import { runShellScript } from "./shell";
 
 export interface StripResult {
   /** File names restored without the `.bak` suffix. */
@@ -16,67 +15,46 @@ export interface StripResult {
   unreadableDirs: string[];
 }
 
+/** One "move this exact file to that exact name" instruction. */
+export interface StripMapping {
+  from: string;
+  to: string;
+}
+
 /**
  * Runs scripts/strip-bak.ps1 through PowerShell, which restores every matching
  * suffixed file under targetPath by copying, verifying with SHA256, then
  * deleting the copy it consumed. Suffixes are stripped repeatedly, so
  * `notes.txt.c.bak` ends up as `notes.txt`.
  *
- * Pass `only` to restrict the run to an exact list of files instead of scanning
- * `targetPath` — used when the caller already knows which names it changed and
- * must not touch anything else in the tree.
+ * Pass `mappings` to hand over an exact rename ledger, or `only` to restrict the
+ * run to an exact list of files instead of scanning `targetPath`.
  *
- * Paths and suffixes travel in FB_ROOT / FB_SUFFIXES / FB_ONLY rather than on
- * the command line, so names with spaces or shell metacharacters cannot break
- * the invocation.
+ * `mappings` is the precise mode: the script never guesses a target name, so a
+ * user file that legitimately ends in one of our suffixes (`report.c1`) keeps
+ * that suffix instead of having it stripped a second time. The round trip uses
+ * it, because it already knows every rename it performed.
+ *
+ * Paths, suffixes and mappings travel in FB_ROOT / FB_SUFFIXES / FB_MAP / FB_ONLY
+ * rather than on the command line, so names with spaces or shell metacharacters
+ * cannot break the invocation.
  */
 export function stripBakSuffix(
   scriptPath: string,
   targetPath: string,
   suffixes: string[] = [".bak"],
-  only?: string[]
+  only?: string[],
+  mappings?: StripMapping[]
 ): Promise<StripResult> {
-  return new Promise<StripResult>((resolve, reject) => {
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      FB_ROOT: targetPath,
-      FB_SUFFIXES: suffixes.join(","),
-    };
-    if (only) {
-      env.FB_ONLY = only.join("\n");
-    }
+  const env: NodeJS.ProcessEnv = {
+    FB_ROOT: targetPath,
+    FB_SUFFIXES: suffixes.join(","),
+  };
+  if (mappings && mappings.length > 0) {
+    env.FB_MAP = mappings.map((m) => `${m.from}\t${m.to}`).join("\n");
+  } else if (only) {
+    env.FB_ONLY = only.join("\n");
+  }
 
-    const child = spawn(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-      { env, windowsHide: true }
-    );
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => (stdout += chunk));
-    child.stderr.on("data", (chunk) => (stderr += chunk));
-
-    child.on("error", (err) => {
-      reject(new Error(`PowerShell 无法启动: ${err.message}`));
-    });
-
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(`PowerShell 退出码 ${code}: ${stderr.trim().slice(0, 200)}`));
-        return;
-      }
-
-      try {
-        resolve(JSON.parse(stdout.trim()) as StripResult);
-      } catch {
-        reject(new Error(`PowerShell 输出无法解析: ${stdout.trim().slice(0, 200)}`));
-      }
-    });
-  });
-}
-
-/** Path of the PowerShell script inside an installed extension folder. */
-export function scriptPathFor(extensionPath: string): string {
-  return path.join(extensionPath, "scripts", "strip-bak.ps1");
+  return runShellScript<StripResult>(scriptPath, env);
 }
